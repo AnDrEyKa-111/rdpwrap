@@ -11,6 +11,7 @@ setlocal EnableDelayedExpansion
 ::                             |_|                                             
 ::
 :: Automatic RDP Wrapper installer and updater             asmtron (2022-01-01)
+:: + fallback mode // AnDrEyKa (2022-06-13)
 :: ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 :: Options:
 ::   -log        = redirect display output to the file autoupdate.log
@@ -38,8 +39,18 @@ set rdpwrap_ini_update_github_5="https://raw.githubusercontent.com/saurav-biswas
 :: set rdpwrap_ini_update_github_6="https://raw.githubusercontent.com/....Extra.6...."
 :: set rdpwrap_ini_update_github_7="https://raw.githubusercontent.com/....Extra.7...."
 ::
+set CURDATE=%DATE: =0%
+set CURTIME=%TIME: =0%
+set TIMESTAMP=_%CURDATE:~8,2%%CURDATE:~3,2%%CURDATE:~0,2%_%CURTIME:~0,2%%CURTIME:~3,2%%CURTIME:~6,2%
+set restart_needed=1
+set rewrite_log=1
+::
 set autoupdate_bat="%~dp0autoupdate.bat"
-set autoupdate_log="%~dp0autoupdate.log"
+if %rewrite_log%==0 (
+    set autoupdate_log="%~dp0logs\autoupdate_%TIMESTAMP%.log"
+) else (
+    set autoupdate_log="%~dp0autoupdate.log"
+)
 set RDPWInst_exe="%~dp0RDPWInst.exe"
 set rdpwrap_dll="%~dp0rdpwrap.dll"
 set rdpwrap_ini="%~dp0rdpwrap.ini"
@@ -58,6 +69,9 @@ fsutil dirty query %systemdrive% >nul
 if not %errorlevel% == 0 goto :not_admin
 :: check for arguments
 if /i "%~1"=="-log" (
+    if %rewrite_log%==0 (
+        if not exist "%~dp0logs" md "%~dp0logs"
+    )
     echo %autoupdate_bat% output from %date% at %time% > %autoupdate_log%
     call %autoupdate_bat% >> %autoupdate_log%
     goto :finish
@@ -110,6 +124,7 @@ sc queryex "TermService"|find "STATE"|find /v "RUNNING" >nul&&(
     call :install
 )||(
     echo [+] TermService running.
+    set rdpwrap_installed="1"
 )
 :: ------------------------------------------
 :: 2) check if listener session rdp-tcp exist
@@ -186,6 +201,7 @@ if "%termsrv_dll_ver%"=="" (
 ) else (
     echo [+] Installed "termsrv.dll" version: %termsrv_dll_ver%.
 )
+if not exist "%windir%\System32\termsrv %termsrv_dll_ver%.dll" copy /y "%windir%\System32\termsrv.dll" "%windir%\System32\termsrv %termsrv_dll_ver%.dll"
 :: ----------------------------------------------------------------------------------------
 :: 7) check if installed fileversion is different to the last saved fileversion in registry
 :: ----------------------------------------------------------------------------------------
@@ -205,6 +221,23 @@ if "%last_termsrv_dll_ver%"=="%termsrv_dll_ver%" (
         call :install
     )
 )
+for /f "tokens=2* usebackq" %%a in (
+    `reg query "HKEY_LOCAL_MACHINE\SOFTWARE\RDP-Wrapper\Autoupdate" /v "termsrv_good.dll" 2^>nul`
+) do (
+    set last_termsrv_good_dll_ver=%%b
+)
+if "%last_termsrv_good_dll_ver%"=="%termsrv_dll_ver%" (
+    echo [+] Current "termsrv.dll v.%termsrv_dll_ver%" same as last supported version "termsrv.dll v.%last_termsrv_good_dll_ver%".
+) else (
+    echo [*] Current "termsrv.dll v.%termsrv_dll_ver%" different from last supported version "termsrv.dll v.%last_termsrv_good_dll_ver%"^^! Your termsrv.dll is updated to new version, need check for support^^!
+)
+for /f "tokens=2* usebackq" %%a in (
+    `reg query "HKEY_LOCAL_MACHINE\SOFTWARE\RDP-Wrapper\Autoupdate" /v "termsrv_bad.dll" 2^>nul`
+) do (
+    set last_termsrv_bad_dll_ver=%%b
+)
+echo [*] Last saved not supported version of termsrv.dll is [%last_termsrv_bad_dll_ver%]
+
 :: ---------------------------------------------------------------
 :: 8) check if installed termsrv.dll version exists in rdpwrap.ini
 :: ---------------------------------------------------------------
@@ -213,7 +246,54 @@ if exist %rdpwrap_ini_check% (
     echo [*] Start searching [%termsrv_dll_ver%] version entry in file %rdpwrap_ini_check%...
     findstr /c:"[%termsrv_dll_ver%]" %rdpwrap_ini_check% >nul&&(
         echo [+] Found "termsrv.dll" version entry [%termsrv_dll_ver%] in file %rdpwrap_ini_check%.
+ 	if not "%last_termsrv_good_dll_ver%" == "%termsrv_dll_ver%" (
+            echo [*] Saving current version ["%termsrv_dll_ver%"] in registry as last supported
+    	    reg add "HKEY_LOCAL_MACHINE\SOFTWARE\RDP-Wrapper\Autoupdate" /v "termsrv_good.dll" /t REG_SZ /d "%termsrv_dll_ver%" /f
+	)
+ 	if not "%last_termsrv_bad_dll_ver%" == "" (
+:check_new_ini
+    	    echo [*] Start searching saved not supported [%last_termsrv_bad_dll_ver%] version entry in file %rdpwrap_ini_check%...
+	    findstr /c:"[%last_termsrv_bad_dll_ver%]" %rdpwrap_ini_check% >nul&& (
+	        echo [+] Support of the last unsupported version %last_termsrv_bad_dll_ver% has been found in ini-file, let's update dll...
+    	        if exist "%windir%\System32\termsrv %last_termsrv_bad_dll_ver%.dll" (
+    	            if not "%last_termsrv_bad_dll_ver%" == "%termsrv_dll_ver%" (
+	                echo [*] Rewrite current supported version %termsrv_dll_ver% to the newly supported one %last_termsrv_bad_dll_ver%
+	                %RDPWInst_exe% -u -k
+	                net stop /y TermService
+	                takeown /F "%windir%\System32\termsrv.dll" /A
+	                ICACLS "%windir%\System32\termsrv.dll" /reset
+	                if not exist "%windir%\System32\termsrv %termsrv_dll_ver%.dll" rename "%windir%\System32\termsrv.dll" "termsrv %termsrv_dll_ver%.dll"
+	                copy /y "%windir%\System32\termsrv %last_termsrv_bad_dll_ver%.dll" "%windir%\System32\termsrv.dll"
+	                net start TermService
+	                %RDPWInst_exe% -i
+		        call :restart
+            	        echo [*] Saving current supported version ["%last_termsrv_bad_dll_ver%"] in registry as current and as last supported. And remove not supported version
+    	                reg add "HKEY_LOCAL_MACHINE\SOFTWARE\RDP-Wrapper\Autoupdate" /v "termsrv_good.dll" /t REG_SZ /d "%last_termsrv_bad_dll_ver%" /f
+    	                reg add "HKEY_LOCAL_MACHINE\SOFTWARE\RDP-Wrapper\Autoupdate" /v "termsrv.dll" /t REG_SZ /d "%last_termsrv_bad_dll_ver%" /f
+    	                reg delete "HKEY_LOCAL_MACHINE\SOFTWARE\RDP-Wrapper\Autoupdate" /v "termsrv_bad.dll" /f
+		        set termsrv_dll_ver="%last_termsrv_bad_dll_ver%"
+		        set termsrv_good_dll_ver="%last_termsrv_bad_dll_ver%"
+		        set last_termsrv_bad_dll_ver=""
+		    ) else (
+	            	echo [-] Current version termsrv.dll is equal to saved new one. Do nothing.
+		    )
+	        ) else (
+	            echo [-] Can't find saved file of last not supported version "%windir%\System32\termsrv %last_termsrv_bad_dll_ver%.dll"^^!
+	        )
+    	    )||(
+	        echo [-] Not found. Try download next location...
+        	if not "!rdpwrap_ini_update_github_%github_location%!" == "" (
+            	    set rdpwrap_ini_url=!rdpwrap_ini_update_github_%github_location%!
+                    set restart_needed=0
+            	    call :update
+                    set restart_needed=1
+            	    goto :check_new_ini
+        	)
+	        echo [-] Last saved not supported version [%last_termsrv_bad_dll_ver%] still have no support in ini-file. 
+	    )
+	)
         echo [*] RDP Wrapper seems to be up-to-date and working...
+        goto :finish
     )||(
         echo [-] NOT found "termsrv.dll" version entry [%termsrv_dll_ver%] in file %rdpwrap_ini_check%^^!
         if not "!rdpwrap_ini_update_github_%github_location%!" == "" (
@@ -221,6 +301,36 @@ if exist %rdpwrap_ini_check% (
             call :update
             goto :check_update
         )
+        echo [*] Finaly, this version is not supported. Saving this version "%termsrv_dll_ver%" in registry as not supported.
+ 	if not "%last_termsrv_bad_dll_ver%" == "%termsrv_dll_ver%" (
+    	    reg add "HKEY_LOCAL_MACHINE\SOFTWARE\RDP-Wrapper\Autoupdate" /v "termsrv_bad.dll" /t REG_SZ /d "%termsrv_dll_ver%" /f
+	    set last_termsrv_bad_dll_ver="%termsrv_dll_ver%"
+	)
+        echo [*] Check if we can roll back to supported version... 
+	if exist "%windir%\System32\termsrv %last_termsrv_good_dll_ver%.dll" (
+	    if not "%last_termsrv_good_dll_ver%" == "%termsrv_dll_ver%" (
+	        echo [+] Rewrite current not supported version %termsrv_dll_ver% to last supported version %last_termsrv_good_dll_ver%
+	        %RDPWInst_exe% -u -k
+	        net stop /y TermService
+	        takeown /F "%windir%\System32\termsrv.dll" /A
+	        ICACLS "%windir%\System32\termsrv.dll" /reset
+	        if not exist "%windir%\System32\termsrv %termsrv_dll_ver%.dll" rename "%windir%\System32\termsrv.dll" "termsrv %termsrv_dll_ver%.dll"
+	        copy /y "%windir%\System32\termsrv %last_termsrv_good_dll_ver%.dll" "%windir%\System32\termsrv.dll"
+	        net start TermService
+	        %RDPWInst_exe% -i
+	        call :restart
+	        echo [*] Saving current supported version ["%last_termsrv_good_dll_ver%"] in registry as current
+    	        reg add "HKEY_LOCAL_MACHINE\SOFTWARE\RDP-Wrapper\Autoupdate" /v "termsrv.dll" /t REG_SZ /d "%last_termsrv_good_dll_ver%" /f
+	        set termsrv_dll_ver="%last_termsrv_good_dll_ver%"
+            	echo [*] termsrv.dll rolled back to last supported version.
+		set github_location=1
+		goto :check_update
+	    ) else (
+            	echo [-] Current version termsrv.dll is equal to saved. Do nothing.
+	    )
+	) else (
+	    echo [-] Can't find saved file of last supported version "%windir%\System32\termsrv %last_termsrv_good_dll_ver%.dll"^^!
+	)
         goto :finish
     )
 ) else (
@@ -246,6 +356,8 @@ if "%rdpwrap_force_uninstall%"=="1" (
 set rdpwrap_installed="1"
 %RDPWInst_exe% -u
 %RDPWInst_exe% -i -o
+:: Add exclusion to widows defender
+powershell Add-MpPreference -ExclusionPath ('C:\Program Files\RDP Wrapper\rdpwrap.dll')
 call :setNLA
 goto :eof
 ::
@@ -304,7 +416,9 @@ for /f "tokens=* usebackq" %%a in (
 if "%download_status%"=="-1" (
     echo [+] Successfully download from GitHhub latest version to %rdpwrap_new_ini%.
     set rdpwrap_ini_check=%rdpwrap_new_ini%
-    call :restart
+    if "%restart_needed%"=="1" (
+        call :restart
+    )
 ) else (
     echo [-] FAILED to download from GitHub latest version to %rdpwrap_new_ini%^^!
     echo [*] Please check you internet connection/firewall and try again^^!
